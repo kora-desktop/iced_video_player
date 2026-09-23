@@ -337,10 +337,11 @@ where
                     shell.request_redraw();
                 } else {
                     // No new frame yet — check again at roughly the next frame time.
+                    // A variable frame rate has no interval to go by; poll at 60 Hz.
                     let frame_interval_ms = if inner.framerate > 0.0 {
                         1000.0 / inner.framerate
                     } else {
-                        40.0
+                        1000.0 / 60.0
                     };
                     shell.request_redraw_at(iced::window::RedrawRequest::At(
                         Instant::now() + Duration::from_millis(frame_interval_ms as u64),

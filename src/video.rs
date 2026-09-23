@@ -641,11 +641,8 @@ impl Video {
         let framerate = framerate.numer() as f64 / framerate.denom() as f64;
         let format = VideoFormat::from_caps(s);
 
-        if framerate.is_nan()
-            || framerate.is_infinite()
-            || framerate < 0.0
-            || framerate.abs() < f64::EPSILON
-        {
+        // 0/1 is a variable frame rate (phone and screen recordings), which plays fine.
+        if framerate.is_nan() || framerate.is_infinite() || framerate < 0.0 {
             let _ = pipeline.set_state(gst::State::Null);
             return Err(Error::Framerate(framerate));
         }
@@ -818,7 +815,7 @@ impl Video {
         (self.read().width, self.read().height)
     }
 
-    /// Get the framerate of the video as frames per second.
+    /// Get the framerate of the video as frames per second, or 0 for a variable frame rate.
     pub fn framerate(&self) -> f64 {
         self.read().framerate
     }
