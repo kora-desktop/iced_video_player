@@ -1192,6 +1192,7 @@ impl Primitive for VideoPrimitive {
                     }
                     let stride = frame_guard.stride();
                     if let Some(readable) = frame_guard.readable() {
+                        trace!("CPU upload");
                         pipeline.upload(
                             device,
                             queue,
