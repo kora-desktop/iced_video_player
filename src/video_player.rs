@@ -347,18 +347,18 @@ where
                     } else {
                         1000.0 / 60.0
                     };
-                    shell.request_redraw_at(iced::window::RedrawRequest::At(
-                        Instant::now() + Duration::from_millis(frame_interval_ms as u64),
-                    ));
+                    shell.request_redraw_at(iced::window::RedrawRequest::At(next_tick(
+                        Duration::from_millis(frame_interval_ms as u64),
+                    )));
                 }
             } else {
                 // Paused or EOS — only wake when a new frame appears (e.g. seek).
                 if inner.upload_frame.load(Ordering::SeqCst) {
                     shell.request_redraw();
                 } else {
-                    shell.request_redraw_at(iced::window::RedrawRequest::At(
-                        Instant::now() + Duration::from_millis(250),
-                    ));
+                    shell.request_redraw_at(iced::window::RedrawRequest::At(next_tick(
+                        Duration::from_millis(250),
+                    )));
                 }
             }
         }
@@ -375,4 +375,21 @@ where
     fn from(video_player: VideoPlayer<'a, Message, Theme, Renderer>) -> Self {
         Self::new(video_player)
     }
+}
+
+/// The next tick after now of a clock that started with the process, `every`
+/// apart.
+///
+/// `iced_winit` keeps the control flow's deadline when a later one is asked
+/// for, even once that deadline has passed, and polls without sleeping until
+/// the later one arrives. A deadline of `now + every`, asked for again on every
+/// redraw, moves later each time — and in a window that redraws for reasons of
+/// its own between frames the event loop spun a core doing nothing. A tick on
+/// a fixed grid is asked for again unchanged.
+fn next_tick(every: Duration) -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    let every = every.as_nanos().max(1);
+    let ticks = Instant::now().duration_since(epoch).as_nanos() / every + 1;
+    epoch + Duration::from_nanos((ticks * every) as u64)
 }
