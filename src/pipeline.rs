@@ -475,11 +475,19 @@ impl VideoPipeline {
             view_formats: vec![],
         };
 
+        // A plane at offset 0 gets a dedicated allocation sized by the image;
+        // one further in is bound into an allocation of the whole DMA-BUF.
+        // `stride × rows` past the offset is not enough for a tiled plane,
+        // whose rows are padded out to whole tiles.
         let y_plane_info = vk_hal::DmaBufPlaneInfo {
             drm_modifier: planes.drm_modifier,
             stride: planes.y_stride,
             offset: planes.y_offset,
-            total_size: 0, // dedicated allocation at offset 0
+            total_size: if planes.y_offset > 0 {
+                planes.y_size
+            } else {
+                0
+            },
         };
 
         let uv_plane_info = vk_hal::DmaBufPlaneInfo {
@@ -487,8 +495,7 @@ impl VideoPipeline {
             stride: planes.uv_stride,
             offset: planes.uv_offset,
             total_size: if planes.uv_offset > 0 {
-                // UV starts at an offset — need to import the full buffer
-                (planes.uv_offset as u64) + (planes.uv_stride as u64) * (height as u64 / 2)
+                planes.uv_size
             } else {
                 0
             },
@@ -552,6 +559,38 @@ impl VideoPipeline {
 
             (imported_y, imported_uv)
         };
+
+        // A video already on screen at this size keeps its GPU-local textures:
+        // the frame is copied into them, and wgpu orders the copy after the
+        // last draw that read them. New textures and a new bind group per
+        // frame were churn for nothing.
+        if let Some(video) = self.videos.get_mut(&video_id)
+            && !video.using_vulkan_export
+            && video.texture_y.size() == import_y_desc.size
+            && video.texture_y.format() == import_y_desc.format
+            && video.texture_uv.size() == import_uv_desc.size
+            && video
+                .texture_y
+                .usage()
+                .contains(wgpu::TextureUsages::COPY_DST)
+        {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("iced_video_player dmabuf copy"),
+            });
+            encoder.copy_texture_to_texture(
+                imported_y.as_image_copy(),
+                video.texture_y.as_image_copy(),
+                import_y_desc.size,
+            );
+            encoder.copy_texture_to_texture(
+                imported_uv.as_image_copy(),
+                video.texture_uv.as_image_copy(),
+                import_uv_desc.size,
+            );
+            queue.submit(Some(encoder.finish()));
+            video._prev_dmabuf_sample = Some(sample);
+            return true;
+        }
 
         // Create GPU-local textures and immediately copy the DMA-BUF data.
         // This captures the frame data before gst-cuda-dmabuf can recycle the
@@ -981,6 +1020,9 @@ pub(crate) struct VideoPrimitive {
     /// Visible/clip rect size in logical pixels (the widget bounds), used to
     /// round the visible corners even when the draw rect overflows under Cover.
     clip_size: (f32, f32),
+    /// Raised when a DMA-BUF frame could not be imported; the video then
+    /// reopens on system memory (`Internal::fall_back_to_system_memory`).
+    dmabuf_rejected: Arc<AtomicBool>,
 }
 
 impl VideoPrimitive {
@@ -995,6 +1037,7 @@ impl VideoPrimitive {
         cuda_upload: Option<gst::Element>,
         border_radius: f32,
         clip_size: (f32, f32),
+        dmabuf_rejected: Arc<AtomicBool>,
     ) -> Self {
         VideoPrimitive {
             video_id,
@@ -1006,6 +1049,7 @@ impl VideoPrimitive {
             cuda_upload,
             border_radius,
             clip_size,
+            dmabuf_rejected,
         }
     }
 }
@@ -1125,8 +1169,19 @@ impl Primitive for VideoPrimitive {
                     }
                 }
 
-                // Fallback: CPU copy via write_texture.
-                if !used_dmabuf {
+                // A DMA-BUF that did not import is not a CPU fallback: its
+                // memory is tiled more often than not, and mapped linearly it
+                // is noise. The frame on screen stays, and the video is told
+                // to reopen on system memory.
+                if is_dmabuf && !used_dmabuf {
+                    if !self.dmabuf_rejected.swap(true, Ordering::SeqCst) {
+                        warn!(
+                            memory_info = %frame_guard.debug_memory_info(),
+                            "DMA-BUF import failed"
+                        );
+                    }
+                } else if !used_dmabuf {
+                    // Fallback: CPU copy via write_texture.
                     static LOGGED_CPU: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
                     if !LOGGED_CPU.swap(true, Ordering::Relaxed) {

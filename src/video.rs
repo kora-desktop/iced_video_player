@@ -12,7 +12,7 @@ use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Video pixel format for the decoded frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,29 +147,30 @@ impl Frame {
     /// stride, offset, and DRM modifier information needed for Vulkan import.
     pub fn dmabuf_fds(&self) -> Option<DmaBufPlanes> {
         let buffer = self.sample.buffer()?;
-        let n = buffer.n_memory();
-        if n == 0 {
+        if buffer.n_memory() == 0 {
             return None;
         }
 
-        let mem0 = buffer.peek_memory(0);
-        let dmabuf0 = mem0.downcast_memory_ref::<DmaBufMemory>()?;
-        let fd0 = dmabuf0.fd();
+        // Stride and offset per plane from GstVideoMeta (attached by
+        // cudadmabufupload, and by a VA decoder, which will not hand out a
+        // DMA-BUF to a sink that does not read it).
+        let meta = buffer.meta::<VideoMeta>()?;
+        let strides = meta.stride();
+        let offsets = meta.offset();
+        let y_stride = *strides.first()? as u32;
+        let uv_stride = *strides.get(1)? as u32;
 
-        // Get stride/offset from GstVideoMeta (attached by cudadmabufupload).
-        let video_meta = buffer.meta::<VideoMeta>();
-        let (y_stride, uv_stride, y_offset, uv_offset) = if let Some(meta) = video_meta {
-            let strides = meta.stride();
-            let offsets = meta.offset();
-            (
-                strides.first().copied().unwrap_or(0) as u32,
-                strides.get(1).copied().unwrap_or(0) as u32,
-                offsets.first().copied().unwrap_or(0) as u32,
-                offsets.get(1).copied().unwrap_or(0) as u32,
-            )
-        } else {
-            (0, 0, 0, 0)
+        // A VideoMeta offset counts from the start of the BUFFER, which may
+        // span one DMA-BUF per plane: each plane is imported from the memory
+        // that holds it, at its offset within that memory's fd.
+        let plane = |offset: usize| -> Option<(RawFd, u32, u64)> {
+            let (range, skip) = buffer.find_memory(offset..offset + 1)?;
+            let mem = buffer.peek_memory(range.start);
+            let fd = mem.downcast_memory_ref::<DmaBufMemory>()?.fd();
+            Some((fd, (mem.offset() + skip) as u32, fd_size(fd)))
         };
+        let (fd0, y_offset, y_size) = plane(*offsets.first()?)?;
+        let (fd1, uv_offset, uv_size) = plane(*offsets.get(1)?)?;
 
         // Parse DRM modifier from caps drm-format field: "NV12:0x..."
         let drm_modifier = self
@@ -183,27 +184,8 @@ impl Frame {
             })
             .unwrap_or(0);
 
-        if n >= 2 {
-            // Separate DMA-BUF per plane
-            let mem1 = buffer.peek_memory(1);
-            if let Some(dmabuf1) = mem1.downcast_memory_ref::<DmaBufMemory>() {
-                let y_guard = FdGuard::new(unsafe { libc::dup(fd0) })?;
-                let uv_guard = FdGuard::new(unsafe { libc::dup(dmabuf1.fd()) })?;
-                return Some(DmaBufPlanes {
-                    y_fd: y_guard.take(),
-                    uv_fd: uv_guard.take(),
-                    drm_modifier,
-                    y_stride,
-                    uv_stride,
-                    y_offset,
-                    uv_offset,
-                });
-            }
-        }
-
-        // Single DMA-BUF with both planes
         let y_guard = FdGuard::new(unsafe { libc::dup(fd0) })?;
-        let uv_guard = FdGuard::new(unsafe { libc::dup(fd0) })?;
+        let uv_guard = FdGuard::new(unsafe { libc::dup(fd1) })?;
         Some(DmaBufPlanes {
             y_fd: y_guard.take(),
             uv_fd: uv_guard.take(),
@@ -212,6 +194,8 @@ impl Frame {
             uv_stride,
             y_offset,
             uv_offset,
+            y_size,
+            uv_size,
         })
     }
 
@@ -251,6 +235,19 @@ pub(crate) struct DmaBufPlanes {
     pub y_offset: u32,
     /// Byte offset of UV plane within its DMA-BUF.
     pub uv_offset: u32,
+    /// Size of the DMA-BUF holding the Y plane. A plane that does not start
+    /// at 0 is bound into an allocation of the whole buffer, and a tiled
+    /// plane can need more than `stride × rows` of it.
+    pub y_size: u64,
+    /// Size of the DMA-BUF holding the UV plane.
+    pub uv_size: u64,
+}
+
+/// A DMA-BUF's size: where `SEEK_END` lands.
+fn fd_size(fd: RawFd) -> u64 {
+    let size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+    unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+    size.max(0) as u64
 }
 
 /// RAII wrapper for a raw file descriptor. Closes the fd on drop.
@@ -318,9 +315,71 @@ pub(crate) struct Internal {
 
     /// Reference to the cudadmabufupload element (if present) for Vulkan export setup.
     pub(crate) cuda_upload: Option<gst::Element>,
+
+    /// Set by the renderer when it could not import a DMA-BUF frame (a
+    /// modifier the Vulkan driver does not take, no Vulkan at all). The
+    /// frame's bytes are no use to the CPU path either — tiled memory mapped
+    /// linearly is noise — so the next update moves to system memory.
+    pub(crate) dmabuf_rejected: Arc<AtomicBool>,
+    /// Playing from system memory after a rejected import.
+    pub(crate) on_system_memory: bool,
 }
 
 impl Internal {
+    /// Stop asking for DMA-BUF: the same file on a pipeline whose sink takes
+    /// system-memory NV12/P010 only, where this one was, playing if it was.
+    ///
+    /// Renegotiating the running pipeline does not work: playsink's
+    /// `videoconvert` passes `DMA_DRM` through untouched, so the decoder
+    /// keeps choosing it, the converter cannot turn it into what the sink
+    /// now takes, and the stream stops `not-negotiated`. So it is rebuilt,
+    /// and keeps this video's id, which is what the renderer's textures are
+    /// kept under.
+    pub(crate) fn fall_back_to_system_memory(&mut self) {
+        if self.on_system_memory {
+            return;
+        }
+        self.on_system_memory = true;
+        warn!("DMA-BUF frames cannot be imported here; reopening on system memory");
+        // `current-uri`: once the file is playing, playbin's `uri` answers for
+        // the NEXT source group, which is empty.
+        let Some(uri) = self.source.property::<Option<String>>("current-uri") else {
+            warn!("no URI to reopen");
+            return;
+        };
+        let position = self.source.query_position::<gst::ClockTime>();
+        let paused = self.paused();
+        let _ = self.source.set_state(gst::State::Null);
+        let description = format!(
+            "playbin uri=\"{uri}\" text-sink=\"{TEXT_SINK}\" video-sink=\"appsink name=iced_video drop=true wait-on-eos=false caps={SYSTEM_MEMORY_CAPS}\""
+        );
+        let mut fresh = match Video::try_launch_playbin(&description, true, &|_| {}) {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                warn!(%error, "the system-memory pipeline did not open either");
+                return;
+            }
+        };
+        let old = fresh.0.get_mut().expect("lock");
+        std::mem::swap(self, old);
+        // Keep what the renderer and the caller know this video by.
+        std::mem::swap(&mut self.id, &mut old.id);
+        std::mem::swap(&mut self.alive, &mut old.alive);
+        self.looping = old.looping;
+        self.on_system_memory = true;
+        // `fresh` now holds the old pipeline, already stopped, and its Drop
+        // lets go of it.
+        drop(fresh);
+        if let Some(at) = position {
+            let _ = self
+                .source
+                .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, at);
+        }
+        if !paused {
+            self.set_paused(false);
+        }
+    }
+
     pub(crate) fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
         let position = match position.into() {
             // Clamp time-based seeks to duration to avoid GStreamer errors.
@@ -453,57 +512,110 @@ impl Drop for Video {
     }
 }
 
+/// What the generic DMA-BUF pipeline's appsink takes, in order of preference.
+///
+/// `format=DMA_DRM` is how `GStreamer` 1.24+ describes a DMA-BUF: the real
+/// format and its DRM modifier travel in `drm-format` (`NV12:0x…`). A VA
+/// decoder offers nothing else, so a sink asking for DMA-BUF NV12 the older
+/// way never matched one and every frame was downloaded to system memory.
+/// The older form stays for producers that still use it.
+const DMABUF_CAPS: &str = "video/x-raw(memory:DMABuf),format=DMA_DRM,pixel-aspect-ratio=1/1;\
+     video/x-raw(memory:DMABuf),format={NV12,P010_10LE},pixel-aspect-ratio=1/1;\
+     video/x-raw,format={NV12,P010_10LE},pixel-aspect-ratio=1/1";
+
+/// System-memory NV12/P010 only: the CPU-copy path.
+const SYSTEM_MEMORY_CAPS: &str = "video/x-raw,format={NV12,P010_10LE},pixel-aspect-ratio=1/1";
+
+/// The `text-sink` every playbin here uses.
+const TEXT_SINK: &str = "appsink name=iced_text sync=true drop=true wait-on-eos=false";
+
 impl Video {
-    /// Create a new video player from a given video which loads from `uri`.
+    /// Create a new video player from a given video which loads from `uri`,
+    /// and start playing it.
     /// Note that live sources will report the duration to be zero.
     ///
     /// Attempts a DMA-BUF zero-copy pipeline first (no `videoconvert`, hardware
     /// decoders can pass DMA-BUF NV12 directly). Falls back to CPU-copy pipeline
     /// with `videoconvert` if the DMA-BUF pipeline fails to negotiate.
+    ///
+    /// `ICED_VIDEO_PLAYER_DMABUF=0` skips the DMA-BUF pipelines.
     pub fn new(uri: &url::Url) -> Result<Self, Error> {
+        Self::open(uri, false, &|_| {})
+    }
+
+    /// Like [`Video::new`], but the video is left paused on its first frame:
+    /// opening a file is not always asking to hear it.
+    pub fn new_paused(uri: &url::Url) -> Result<Self, Error> {
+        Self::open(uri, true, &|_| {})
+    }
+
+    /// Like [`Video::new_paused`], with `configure` run on each pipeline tried
+    /// before it starts: the place for what has to be in hand before the
+    /// first element is added, such as a `deep-element-added` handler that
+    /// sets a decoder's properties.
+    pub fn new_paused_with(
+        uri: &url::Url,
+        configure: impl Fn(&gst::Pipeline),
+    ) -> Result<Self, Error> {
+        Self::open(uri, true, &configure)
+    }
+
+    fn open(
+        uri: &url::Url,
+        paused: bool,
+        configure: &dyn Fn(&gst::Pipeline),
+    ) -> Result<Self, Error> {
         gst::init()?;
 
         // Pipeline priority:
         // 1. NVIDIA CUDA → DMA-BUF zero-copy (nvh264dec → cudadmabufupload → appsink)
         // 2. Generic DMA-BUF (VA-API decoders produce DMA-BUF directly)
         // 3. CPU fallback (videoconvert → system memory NV12)
-
-        // Try NVIDIA CUDA → DMA-BUF pipeline (cudadmabufupload converts CUDA memory to DMA-BUF).
-        // Constrain the appsink to NV12/P010 (accepting DMA-BUF *or* system memory):
-        // without this, the sink may negotiate planar I420, which the NV12-assuming
-        // upload/shader read as interleaved UV → a green/magenta chroma cast.
-        let nvidia_pipeline = format!(
-            "playbin uri=\"{}\" text-sink=\"appsink name=iced_text sync=true drop=true wait-on-eos=false\" video-sink=\"cudadmabufupload name=cuda_upload force-linear=true ! appsink name=iced_video drop=true wait-on-eos=false caps=video/x-raw(memory:DMABuf),format={{NV12,P010_10LE}},pixel-aspect-ratio=1/1;video/x-raw,format={{NV12,P010_10LE}},pixel-aspect-ratio=1/1\"",
-            uri.as_str()
-        );
-        match Self::try_launch_playbin(&nvidia_pipeline) {
-            Ok(video) => {
-                info!("Using NVIDIA CUDA→DMA-BUF zero-copy pipeline");
-                return Ok(video);
-            }
-            Err(e) => {
-                debug!(error = %e, "NVIDIA DMA-BUF pipeline not available, trying next");
+        let dmabuf = std::env::var("ICED_VIDEO_PLAYER_DMABUF").as_deref() != Ok("0");
+        // Only where the element exists. The parser drops an element it cannot
+        // find from a property's bin description without failing, so without
+        // this check the "NVIDIA" pipeline launched everywhere as a bare
+        // system-memory appsink, and the VA path below was never reached.
+        if dmabuf && gst::ElementFactory::find("cudadmabufupload").is_some() {
+            // Try NVIDIA CUDA → DMA-BUF pipeline (cudadmabufupload converts CUDA memory to DMA-BUF).
+            // Constrain the appsink to NV12/P010 (accepting DMA-BUF *or* system memory):
+            // without this, the sink may negotiate planar I420, which the NV12-assuming
+            // upload/shader read as interleaved UV → a green/magenta chroma cast.
+            let nvidia_pipeline = format!(
+                "playbin uri=\"{}\" text-sink=\"{TEXT_SINK}\" video-sink=\"cudadmabufupload name=cuda_upload force-linear=true ! appsink name=iced_video drop=true wait-on-eos=false caps=video/x-raw(memory:DMABuf),format={{NV12,P010_10LE}},pixel-aspect-ratio=1/1;video/x-raw,format={{NV12,P010_10LE}},pixel-aspect-ratio=1/1\"",
+                uri.as_str()
+            );
+            match Self::try_launch_playbin(&nvidia_pipeline, paused, configure) {
+                Ok(video) => {
+                    info!("Using NVIDIA CUDA→DMA-BUF zero-copy pipeline");
+                    return Ok(video);
+                }
+                Err(e) => {
+                    debug!(error = %e, "NVIDIA DMA-BUF pipeline not available, trying next");
+                }
             }
         }
 
-        // Try generic DMA-BUF pipeline (VA-API decoders on Intel/AMD)
-        let dmabuf_pipeline = format!(
-            "playbin uri=\"{}\" text-sink=\"appsink name=iced_text sync=true drop=true wait-on-eos=false\" video-sink=\"appsink name=iced_video drop=true wait-on-eos=false caps=video/x-raw(memory:DMABuf),format={{NV12,P010_10LE}},pixel-aspect-ratio=1/1;video/x-raw,format={{NV12,P010_10LE}},pixel-aspect-ratio=1/1\"",
-            uri.as_str()
-        );
-        match Self::try_launch_playbin(&dmabuf_pipeline) {
-            Ok(video) => {
-                info!("Using DMA-BUF-capable pipeline");
-                return Ok(video);
-            }
-            Err(e) => {
-                debug!(error = %e, "DMA-BUF pipeline not available, trying next");
+        if dmabuf {
+            // Try generic DMA-BUF pipeline (VA-API decoders on Intel/AMD)
+            let dmabuf_pipeline = format!(
+                "playbin uri=\"{}\" text-sink=\"{TEXT_SINK}\" video-sink=\"appsink name=iced_video drop=true wait-on-eos=false caps={DMABUF_CAPS}\"",
+                uri.as_str()
+            );
+            match Self::try_launch_playbin(&dmabuf_pipeline, paused, configure) {
+                Ok(video) => {
+                    info!("Using DMA-BUF-capable pipeline");
+                    return Ok(video);
+                }
+                Err(e) => {
+                    debug!(error = %e, "DMA-BUF pipeline not available, trying next");
+                }
             }
         }
 
         // Fallback: CPU copy with videoconvert
         info!("Falling back to CPU-copy pipeline");
-        Self::try_launch_playbin(&Self::software_pipeline(uri))
+        Self::try_launch_playbin(&Self::software_pipeline(uri), paused, configure)
     }
 
     /// Creates a video that always uses the simple **CPU-copy** pipeline
@@ -516,22 +628,27 @@ impl Video {
     pub fn new_software(uri: &url::Url) -> Result<Self, Error> {
         gst::init()?;
         info!("Using software CPU-copy pipeline (requested)");
-        Self::try_launch_playbin(&Self::software_pipeline(uri))
+        Self::try_launch_playbin(&Self::software_pipeline(uri), false, &|_| {})
     }
 
     /// The simple CPU-copy `playbin` pipeline string (system-memory NV12/P010).
     fn software_pipeline(uri: &url::Url) -> String {
         format!(
-            "playbin uri=\"{}\" text-sink=\"appsink name=iced_text sync=true drop=true wait-on-eos=false\" video-sink=\"videoscale ! videoconvert ! appsink name=iced_video drop=true wait-on-eos=false caps=video/x-raw,format={{NV12,P010_10LE}},pixel-aspect-ratio=1/1\"",
+            "playbin uri=\"{}\" text-sink=\"{TEXT_SINK}\" video-sink=\"videoscale ! videoconvert ! appsink name=iced_video drop=true wait-on-eos=false caps={SYSTEM_MEMORY_CAPS}\"",
             uri.as_str()
         )
     }
 
     /// Try to launch a playbin pipeline string and wire up sinks.
-    fn try_launch_playbin(pipeline_str: &str) -> Result<Self, Error> {
+    fn try_launch_playbin(
+        pipeline_str: &str,
+        paused: bool,
+        configure: &dyn Fn(&gst::Pipeline),
+    ) -> Result<Self, Error> {
         let pipeline = gst::parse::launch(pipeline_str)?
             .downcast::<gst::Pipeline>()
             .map_err(|_| Error::Cast)?;
+        configure(&pipeline);
 
         // Extract the video appsink from the video-sink property.
         // gst_parse wraps element descriptions in a GstBin with ghost pads,
@@ -545,7 +662,7 @@ impl Video {
         let text_sink: gst::Element = pipeline.property("text-sink");
         let text_sink = Self::find_appsink(&text_sink, "iced_text")?;
 
-        let mut video = Self::from_gst_pipeline(pipeline, video_sink, Some(text_sink))?;
+        let mut video = Self::build(pipeline, video_sink, Some(text_sink), paused)?;
         video.0.get_mut().expect("lock").cuda_upload = cuda_upload;
         Ok(video)
     }
@@ -610,6 +727,15 @@ impl Video {
         video_sink: gst_app::AppSink,
         text_sink: Option<gst_app::AppSink>,
     ) -> Result<Self, Error> {
+        Self::build(pipeline, video_sink, text_sink, false)
+    }
+
+    fn build(
+        pipeline: gst::Pipeline,
+        video_sink: gst_app::AppSink,
+        text_sink: Option<gst_app::AppSink>,
+        paused: bool,
+    ) -> Result<Self, Error> {
         gst::init()?;
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
@@ -624,41 +750,6 @@ impl Video {
                 })
             };
         }
-
-        let pad = video_sink.pads().first().cloned().unwrap();
-
-        cleanup!(pipeline.set_state(gst::State::Playing))?;
-
-        // wait for up to 5 seconds until the decoder gets the source capabilities
-        cleanup!(pipeline.state(gst::ClockTime::from_seconds(5)).0)?;
-
-        // extract resolution, framerate, and pixel format
-        let caps = cleanup!(pad.current_caps().ok_or(Error::Caps))?;
-        let s = cleanup!(caps.structure(0).ok_or(Error::Caps))?;
-        let width = cleanup!(s.get::<i32>("width").map_err(|_| Error::Caps))?;
-        let height = cleanup!(s.get::<i32>("height").map_err(|_| Error::Caps))?;
-        let framerate = cleanup!(s.get::<gst::Fraction>("framerate").map_err(|_| Error::Caps))?;
-        let framerate = framerate.numer() as f64 / framerate.denom() as f64;
-        let format = VideoFormat::from_caps(s);
-
-        // 0/1 is a variable frame rate (phone and screen recordings), which plays fine.
-        if framerate.is_nan() || framerate.is_infinite() || framerate < 0.0 {
-            let _ = pipeline.set_state(gst::State::Null);
-            return Err(Error::Framerate(framerate));
-        }
-
-        let duration = Duration::from_nanos(
-            pipeline
-                .query_duration::<gst::ClockTime>()
-                .map(|duration| duration.nseconds())
-                .unwrap_or(0),
-        );
-
-        let sync_av = pipeline.has_property("av-offset", None);
-
-        info!(width, height, ?format, framerate, "Video negotiated");
-        // Full caps (format/colorimetry/range) — handy when chroma looks wrong.
-        debug!(caps = %caps.to_string(), "negotiated caps");
 
         let frame = Arc::new(Mutex::new(Frame::empty()));
         let upload_frame = Arc::new(AtomicBool::new(false));
@@ -762,9 +853,78 @@ impl Video {
                         debug!("video appsink reached EOS");
                         reached_eos_ref.store(true, Ordering::SeqCst);
                     })
+                    // A VA decoder hands out a DMA-BUF only to a sink that
+                    // reads the plane layout from VideoMeta; without it in
+                    // the allocation query it refuses to negotiate at all.
+                    // System memory is left alone: the CPU upload assumes
+                    // the default layout, which is what it gets without it.
+                    .propose_allocation(|_sink, query| {
+                        let dmabuf = query.get_owned().0.is_some_and(|caps| {
+                            caps.features(0)
+                                .is_some_and(|f| f.contains("memory:DMABuf"))
+                        });
+                        if dmabuf {
+                            query.add_allocation_meta::<VideoMeta>(None);
+                        }
+                        true
+                    })
                     .build(),
             );
         }
+
+        // The callbacks are in place before anything flows: the allocation
+        // query and the first (preroll) frame both happen on the way to
+        // PAUSED.
+        let pad = video_sink.pads().first().cloned().unwrap();
+        let target = if paused {
+            gst::State::Paused
+        } else {
+            gst::State::Playing
+        };
+        cleanup!(pipeline.set_state(target))?;
+
+        // wait for up to 5 seconds until the decoder gets the source capabilities
+        cleanup!(pipeline.state(gst::ClockTime::from_seconds(5)).0)?;
+
+        // extract resolution, framerate, and pixel format
+        let caps = cleanup!(pad.current_caps().ok_or(Error::Caps))?;
+        let s = cleanup!(caps.structure(0).ok_or(Error::Caps))?;
+        let width = cleanup!(s.get::<i32>("width").map_err(|_| Error::Caps))?;
+        let height = cleanup!(s.get::<i32>("height").map_err(|_| Error::Caps))?;
+        let framerate = cleanup!(s.get::<gst::Fraction>("framerate").map_err(|_| Error::Caps))?;
+        let framerate = framerate.numer() as f64 / framerate.denom() as f64;
+        let format = VideoFormat::from_caps(s);
+
+        // DMA_DRM caps cannot name the formats they take, so a DMA-BUF of
+        // something other than NV12/P010 is turned down here, and the next
+        // pipeline tried.
+        if let Ok(drm_format) = s.get::<&str>("drm-format") {
+            let fourcc = drm_format.split(':').next().unwrap_or_default();
+            if !matches!(fourcc, "NV12" | "P010") {
+                debug!(drm_format, "DMA-BUF format this player cannot draw");
+                let _ = pipeline.set_state(gst::State::Null);
+                return Err(Error::Caps);
+            }
+        }
+
+        // 0/1 is a variable frame rate (phone and screen recordings), which plays fine.
+        if framerate.is_nan() || framerate.is_infinite() || framerate < 0.0 {
+            let _ = pipeline.set_state(gst::State::Null);
+            return Err(Error::Framerate(framerate));
+        }
+
+        let duration = Duration::from_nanos(
+            pipeline
+                .query_duration::<gst::ClockTime>()
+                .map(|duration| duration.nseconds())
+                .unwrap_or(0),
+        );
+
+        let sync_av = pipeline.has_property("av-offset", None);
+
+        info!(width, height, ?format, framerate, "Video negotiated");
+        // Full caps (format/colorimetry/range) — handy when chroma looks wrong.
+        debug!(caps = %caps.to_string(), "negotiated caps");
 
         Ok(Video(RwLock::new(Internal {
             id,
@@ -795,6 +955,9 @@ impl Video {
             upload_text,
 
             cuda_upload: None,
+
+            dmabuf_rejected: Arc::new(AtomicBool::new(false)),
+            on_system_memory: false,
         })))
     }
 
@@ -873,7 +1036,13 @@ impl Video {
     /// Passing `true` to the `accurate` parameter will result in more accurate seeking,
     /// however, it is also slower. For most seeks (e.g., scrubbing) this is not needed.
     pub fn seek(&mut self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
-        self.get_mut().seek(position, accurate)
+        let mut inner = self.get_mut();
+        inner.seek(position, accurate)?;
+        // A flushing seek takes the stream off its end: played from there, it
+        // goes on from where it was put rather than starting over.
+        inner.is_eos = false;
+        inner.reached_eos.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Steps forward exactly one frame in playback.

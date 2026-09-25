@@ -232,6 +232,7 @@ where
                     inner.cuda_upload.clone(),
                     self.border_radius,
                     (bounds.width, bounds.height),
+                    Arc::clone(&inner.dmabuf_rejected),
                 ),
             );
         };
@@ -256,6 +257,9 @@ where
         let mut inner = self.video.write();
 
         if let iced::Event::Window(iced::window::Event::RedrawRequested(_)) = event {
+            if inner.dmabuf_rejected.load(Ordering::SeqCst) {
+                inner.fall_back_to_system_memory();
+            }
             if inner.restart_stream || (!inner.is_eos && !inner.paused()) {
                 let mut restart_stream = false;
                 let emit_eos = !inner.restart_stream;

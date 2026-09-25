@@ -40,7 +40,7 @@ iced = { git = "https://github.com/playtron-os/iced.git", default-features = fal
 iced_wgpu = { git = "https://github.com/playtron-os/iced.git" }
 gstreamer = "0.23"
 gstreamer-allocators = "0.23" # DMA-BUF memory detection
-gstreamer-app = "0.23" # appsink
+gstreamer-app = { version = "0.23", features = ["v1_24"] } # appsink; propose_allocation for VideoMeta
 gstreamer-base = "0.23" # basesrc
 gstreamer-video = "0.23" # VideoMeta
 glib = "0.20" # gobject traits and error type
