@@ -1,3 +1,4 @@
+use crate::gpu::RenderGpu;
 use crate::video::{DmaBufPlanes, FdGuard, Frame, VideoFormat};
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -72,6 +73,8 @@ pub(crate) struct VideoPipeline {
     bg0_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     videos: BTreeMap<u64, VideoEntry>,
+    /// What the device takes from a DMA-BUF.
+    gpu: RenderGpu,
 }
 
 impl Pipeline for VideoPipeline {
@@ -181,6 +184,7 @@ impl Pipeline for VideoPipeline {
             bg0_layout,
             sampler,
             videos: BTreeMap::new(),
+            gpu: RenderGpu::of(device),
         }
     }
 
@@ -395,6 +399,16 @@ impl VideoPipeline {
         // .take() transfers ownership to Vulkan import below.
         let y_guard = FdGuard::new(planes.y_fd).expect("y_fd from DmaBufPlanes must be valid");
         let uv_guard = FdGuard::new(planes.uv_fd).expect("uv_fd from DmaBufPlanes must be valid");
+
+        // Vulkan takes a modifier it does not support without a word and
+        // samples noise, so a foreign tiling is refused here.
+        if !self.gpu.reads(format, planes.drm_modifier) {
+            warn!(
+                drm_modifier = format_args!("0x{:x}", planes.drm_modifier),
+                "DMA-BUF tiling not readable by the renderer's GPU"
+            );
+            return false;
+        }
 
         // Imported DMA-BUF textures need COPY_SRC so we can copy to GPU-local textures.
         let import_y_desc = wgpu::TextureDescriptor {
@@ -1021,7 +1035,7 @@ pub(crate) struct VideoPrimitive {
     /// round the visible corners even when the draw rect overflows under Cover.
     clip_size: (f32, f32),
     /// Raised when a DMA-BUF frame could not be imported; the video then
-    /// reopens on system memory (`Internal::fall_back_to_system_memory`).
+    /// reopens elsewhere (`Internal::fall_back`).
     dmabuf_rejected: Arc<AtomicBool>,
 }
 
@@ -1171,8 +1185,8 @@ impl Primitive for VideoPrimitive {
 
                 // A DMA-BUF that did not import is not a CPU fallback: its
                 // memory is tiled more often than not, and mapped linearly it
-                // is noise. The frame on screen stays, and the video is told
-                // to reopen on system memory.
+                // is noise. The frame on screen stays, and the video reopens on the
+                // renderer's GPU or on system memory (`Internal::fall_back`).
                 if is_dmabuf && !used_dmabuf {
                     if !self.dmabuf_rejected.swap(true, Ordering::SeqCst) {
                         warn!(

@@ -258,7 +258,7 @@ where
 
         if let iced::Event::Window(iced::window::Event::RedrawRequested(_)) = event {
             if inner.dmabuf_rejected.load(Ordering::SeqCst) {
-                inner.fall_back_to_system_memory();
+                inner.fall_back();
             }
             if inner.restart_stream || (!inner.is_eos && !inner.paused()) {
                 let mut restart_stream = false;
