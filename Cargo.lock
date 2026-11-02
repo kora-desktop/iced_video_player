@@ -1794,6 +1794,7 @@ dependencies = [
  "gstreamer-video",
  "iced",
  "iced_wgpu",
+ "image",
  "libc",
  "pollster",
  "thiserror 1.0.69",

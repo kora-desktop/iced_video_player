@@ -57,4 +57,6 @@ targets = ["wasm32-unknown-unknown"]
 
 [dev-dependencies]
 pollster = "0.4"
+# Reads the test frame and writes its golden.
+image = { version = "0.25", default-features = false, features = ["png"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

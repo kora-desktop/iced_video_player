@@ -51,10 +51,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         1, 1.8556, 0,
     );
 
+    // How many texels of each plane one screen pixel covers.
+    let per_pixel = fwidth(in.uv);
+    let y_texels = per_pixel * vec2<f32>(textureDimensions(tex_y));
+    let uv_texels = per_pixel * vec2<f32>(textureDimensions(tex_uv));
+
     var yuv = vec3<f32>(0.0);
-    yuv.x = (textureSample(tex_y, s, in.uv).r - 0.0625) / 0.8588;
-    yuv.y = (textureSample(tex_uv, s, in.uv).r - 0.5) / 0.8784;
-    yuv.z = (textureSample(tex_uv, s, in.uv).g - 0.5) / 0.8784;
+    yuv.x = (footprint(tex_y, in.uv, y_texels).r - 0.0625) / 0.8588;
+    let chroma = footprint(tex_uv, in.uv, uv_texels).rg;
+    yuv.y = (chroma.x - 0.5) / 0.8784;
+    yuv.z = (chroma.y - 0.5) / 0.8784;
 
     var rgb = clamp(yuv * yuv2rgb, vec3<f32>(0), vec3<f32>(1));
 
@@ -80,4 +86,25 @@ fn rounded_box_sdf(p: vec2<f32>, size: vec2<f32>, corners: vec4<f32>) -> f32 {
     let corner = select(box_half.y, box_half.x, p.y > 0.0);
     let q = abs(p) - size + corner;
     return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0))) - corner;
+}
+
+// Taps per axis at most: up to 8x minification still leaves no texel unread,
+// since each bilinear tap reads two.
+const MAX_TAPS: f32 = 4.0;
+
+// The average of the texels under one screen pixel: one bilinear tap when the
+// picture is drawn at its size or larger, a grid of them when it is drawn
+// smaller. A single bilinear tap there skips texels, and small text shimmers
+// and breaks up.
+fn footprint(tex: texture_2d<f32>, uv: vec2<f32>, texels: vec2<f32>) -> vec4<f32> {
+    let taps = clamp(ceil(texels), vec2<f32>(1.0), vec2<f32>(MAX_TAPS));
+    let span = max(texels, vec2<f32>(1.0)) / vec2<f32>(textureDimensions(tex));
+    var sum = vec4<f32>(0.0);
+    for (var j = 0.0; j < taps.y; j += 1.0) {
+        for (var i = 0.0; i < taps.x; i += 1.0) {
+            let offset = (vec2<f32>(i, j) + 0.5) / taps - 0.5;
+            sum += textureSampleLevel(tex, s, uv + offset * span, 0.0);
+        }
+    }
+    return sum / (taps.x * taps.y);
 }
