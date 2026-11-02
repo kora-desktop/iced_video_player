@@ -118,13 +118,26 @@ fn main() {
         backends: wgpu::Backends::VULKAN,
         ..Default::default()
     });
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    }))
+    // `WGPU_ADAPTER_NAME` picks another GPU than the decoder's, as a hybrid
+    // laptop's renderer does.
+    let adapter = pollster::block_on(wgpu::util::initialize_adapter_from_env_or_default(
+        &instance, None,
+    ))
     .expect("no Vulkan adapter");
     println!("GPU: {}", adapter.get_info().name);
+    // What the player checks before importing: a modifier the device does not
+    // list is another GPU's tiling, and imports as noise.
+    let listed = unsafe {
+        adapter.as_hal::<vk_hal::Api>().map(|hal| {
+            let instance = hal.shared_instance().raw_instance();
+            listed_modifiers(instance, hal.raw_physical_device())
+        })
+    }
+    .unwrap_or_default();
+    println!(
+        "renderer lists modifier 0x{modifier:016x} for R8 and RG8: {}",
+        listed.contains(&modifier)
+    );
     assert!(
         adapter
             .features()
@@ -248,6 +261,30 @@ fn pull_nth(description: &str, nth: usize) -> (gst::Sample, gst::Pipeline) {
     }
     pipeline.set_state(gst::State::Paused).unwrap();
     (sample.unwrap(), pipeline)
+}
+
+/// The modifiers both NV12 plane formats list on `physical`.
+fn listed_modifiers(instance: &ash::Instance, physical: ash::vk::PhysicalDevice) -> Vec<u64> {
+    use ash::vk;
+    let of = |format: vk::Format| -> Vec<u64> {
+        let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+        let mut props = vk::FormatProperties2::default().push_next(&mut list);
+        unsafe { instance.get_physical_device_format_properties2(physical, format, &mut props) };
+        let mut entries = vec![
+            vk::DrmFormatModifierPropertiesEXT::default();
+            list.drm_format_modifier_count as usize
+        ];
+        let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+            .drm_format_modifier_properties(&mut entries);
+        let mut props = vk::FormatProperties2::default().push_next(&mut list);
+        unsafe { instance.get_physical_device_format_properties2(physical, format, &mut props) };
+        entries.iter().map(|e| e.drm_format_modifier).collect()
+    };
+    let uv = of(vk::Format::R8G8_UNORM);
+    of(vk::Format::R8_UNORM)
+        .into_iter()
+        .filter(|m| uv.contains(m))
+        .collect()
 }
 
 fn fd_size(fd: i32) -> u64 {

@@ -1785,6 +1785,7 @@ dependencies = [
 name = "iced_video_player"
 version = "0.6.0"
 dependencies = [
+ "ash",
  "glib",
  "gstreamer",
  "gstreamer-allocators",

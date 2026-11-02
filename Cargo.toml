@@ -46,6 +46,7 @@ gstreamer-video = "0.23" # VideoMeta
 glib = "0.20" # gobject traits and error type
 tracing = "0.1"
 libc = "0.2" # dup() for DMA-BUF fd
+ash = "0.38" # the renderer's DRM modifiers and render node, through wgpu's Vulkan HAL
 thiserror = "1"
 url = "2" # media uri
 

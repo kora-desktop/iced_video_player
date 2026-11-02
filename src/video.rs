@@ -323,11 +323,37 @@ pub(crate) struct Internal {
     pub(crate) dmabuf_rejected: Arc<AtomicBool>,
     /// Playing from system memory after a rejected import.
     pub(crate) on_system_memory: bool,
+    /// Reopened once on the renderer's GPU after another GPU's frames were refused.
+    pub(crate) reopened_on_renderer: bool,
 }
 
 impl Internal {
-    /// Stop asking for DMA-BUF: the same file on a pipeline whose sink takes
-    /// system-memory NV12/P010 only, where this one was, playing if it was.
+    /// The renderer could not import a DMA-BUF frame. When another GPU
+    /// decoded it and the renderer's own GPU has a decoder, the file reopens
+    /// there, still on DMA-BUF; otherwise on system-memory NV12/P010 only.
+    pub(crate) fn fall_back(&mut self) {
+        if self.on_system_memory {
+            return;
+        }
+        let renderer = crate::gpu::render_node();
+        let decoder = crate::decoder::node_in(&self.source);
+        let elsewhere = renderer.is_some() && decoder.is_some() && renderer != decoder;
+        if elsewhere
+            && !self.reopened_on_renderer
+            && renderer.is_some_and(crate::decoder::prefer_on)
+        {
+            self.reopened_on_renderer = true;
+            warn!("another GPU decoded this video; reopening on the renderer's");
+            self.reopen(DMABUF_CAPS);
+            return;
+        }
+        self.on_system_memory = true;
+        warn!("DMA-BUF frames cannot be imported here; reopening on system memory");
+        self.reopen(SYSTEM_MEMORY_CAPS);
+    }
+
+    /// The same file on a pipeline whose sink takes `caps`, where this one
+    /// was, playing if it was.
     ///
     /// Renegotiating the running pipeline does not work: playsink's
     /// `videoconvert` passes `DMA_DRM` through untouched, so the decoder
@@ -335,12 +361,7 @@ impl Internal {
     /// now takes, and the stream stops `not-negotiated`. So it is rebuilt,
     /// and keeps this video's id, which is what the renderer's textures are
     /// kept under.
-    pub(crate) fn fall_back_to_system_memory(&mut self) {
-        if self.on_system_memory {
-            return;
-        }
-        self.on_system_memory = true;
-        warn!("DMA-BUF frames cannot be imported here; reopening on system memory");
+    fn reopen(&mut self, caps: &str) {
         // `current-uri`: once the file is playing, playbin's `uri` answers for
         // the NEXT source group, which is empty.
         let Some(uri) = self.source.property::<Option<String>>("current-uri") else {
@@ -351,12 +372,12 @@ impl Internal {
         let paused = self.paused();
         let _ = self.source.set_state(gst::State::Null);
         let description = format!(
-            "playbin uri=\"{uri}\" text-sink=\"{TEXT_SINK}\" video-sink=\"appsink name=iced_video drop=true wait-on-eos=false caps={SYSTEM_MEMORY_CAPS}\""
+            "playbin uri=\"{uri}\" text-sink=\"{TEXT_SINK}\" video-sink=\"appsink name=iced_video drop=true wait-on-eos=false caps={caps}\""
         );
         let mut fresh = match Video::try_launch_playbin(&description, true, &|_| {}) {
             Ok(fresh) => fresh,
             Err(error) => {
-                warn!(%error, "the system-memory pipeline did not open either");
+                warn!(%error, "the reopened pipeline did not open");
                 return;
             }
         };
@@ -366,7 +387,8 @@ impl Internal {
         std::mem::swap(&mut self.id, &mut old.id);
         std::mem::swap(&mut self.alive, &mut old.alive);
         self.looping = old.looping;
-        self.on_system_memory = true;
+        self.on_system_memory = old.on_system_memory;
+        self.reopened_on_renderer = old.reopened_on_renderer;
         // `fresh` now holds the old pipeline, already stopped, and its Drop
         // lets go of it.
         drop(fresh);
@@ -566,6 +588,9 @@ impl Video {
         configure: &dyn Fn(&gst::Pipeline),
     ) -> Result<Self, Error> {
         gst::init()?;
+        if let Some(node) = crate::gpu::render_node() {
+            crate::decoder::prefer_on(node);
+        }
 
         // Pipeline priority:
         // 1. NVIDIA CUDA → DMA-BUF zero-copy (nvh264dec → cudadmabufupload → appsink)
@@ -958,6 +983,7 @@ impl Video {
 
             dmabuf_rejected: Arc::new(AtomicBool::new(false)),
             on_system_memory: false,
+            reopened_on_renderer: false,
         })))
     }
 
