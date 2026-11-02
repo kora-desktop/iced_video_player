@@ -6,11 +6,11 @@
 //!     then use it like any other Iced widget in your `view` function by creating a [`VideoPlayer`].
 //!
 //! Example:
-//! ```rust
+//! ```rust,no_run
 //! use iced_video_player::{Video, VideoPlayer};
 //!
 //! fn main() -> iced::Result {
-//!     iced::run("Video Player", (), App::view)
+//!     iced::run(App::update, App::view)
 //! }
 //!
 //! struct App {
@@ -26,7 +26,9 @@
 //! }
 //!
 //! impl App {
-//!     fn view(&self) -> iced::Element<()> {
+//!     fn update(&mut self, _message: ()) {}
+//!
+//!     fn view(&self) -> iced::Element<'_, ()> {
 //!         VideoPlayer::new(&self.video).into()
 //!     }
 //! }
