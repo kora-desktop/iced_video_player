@@ -1246,3 +1246,7 @@ impl Primitive for VideoPrimitive {
         pipeline.draw(target, encoder, clip_bounds, self.video_id);
     }
 }
+
+#[cfg(test)]
+#[path = "downscale_tests.rs"]
+mod downscale_tests;
