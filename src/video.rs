@@ -12,7 +12,7 @@ use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Video pixel format for the decoded frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,7 +306,8 @@ pub(crate) struct Internal {
     pub(crate) reached_eos: Arc<AtomicBool>,
     pub(crate) looping: bool,
     pub(crate) is_eos: bool,
-    pub(crate) restart_stream: bool,
+    /// The seqnum of the last seek sent, whose end is the only one that counts.
+    pub(crate) last_seek: Mutex<Option<gst::Seqnum>>,
     pub(crate) sync_av_avg: u64,
     pub(crate) sync_av_counter: u64,
 
@@ -411,39 +412,48 @@ impl Internal {
             other => other,
         };
 
+        let flags = gst::SeekFlags::FLUSH
+            | if accurate {
+                gst::SeekFlags::ACCURATE
+            } else {
+                gst::SeekFlags::empty()
+            };
         // gstreamer complains if the start & end value types aren't the same
-        match &position {
-            Position::Time(_) => self.source.seek(
+        let seek = match &position {
+            Position::Time(_) => gst::event::Seek::new(
                 self.speed,
-                gst::SeekFlags::FLUSH
-                    | if accurate {
-                        gst::SeekFlags::ACCURATE
-                    } else {
-                        gst::SeekFlags::empty()
-                    },
+                flags,
                 gst::SeekType::Set,
                 gst::GenericFormattedValue::from(position),
                 gst::SeekType::Set,
                 gst::ClockTime::NONE,
-            )?,
-            Position::Frame(_) => self.source.seek(
+            ),
+            Position::Frame(_) => gst::event::Seek::new(
                 self.speed,
-                gst::SeekFlags::FLUSH
-                    | if accurate {
-                        gst::SeekFlags::ACCURATE
-                    } else {
-                        gst::SeekFlags::empty()
-                    },
+                flags,
                 gst::SeekType::Set,
                 gst::GenericFormattedValue::from(position),
                 gst::SeekType::Set,
                 gst::format::Default::NONE,
-            )?,
+            ),
         };
+        self.send_seek(seek)?;
 
         *self.subtitle_text.lock().expect("lock subtitle_text") = None;
         self.upload_text.store(true, Ordering::SeqCst);
 
+        Ok(())
+    }
+
+    /// A flushing seek takes the stream off its end. `playbin` can still post the end it
+    /// reached before, once it plays again, so only an end with this seek's seqnum counts.
+    fn send_seek(&self, seek: gst::Event) -> Result<(), Error> {
+        let seqnum = seek.seqnum();
+        if !self.source.send_event(seek) {
+            return Err(gst::glib::bool_error!("Failed to seek").into());
+        }
+        *self.last_seek.lock().expect("lock last_seek") = Some(seqnum);
+        self.reached_eos.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -452,37 +462,83 @@ impl Internal {
             return Err(Error::Caps);
         };
         if speed > 0.0 {
-            self.source.seek(
+            self.send_seek(gst::event::Seek::new(
                 speed,
                 gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
                 gst::SeekType::Set,
                 position,
                 gst::SeekType::End,
                 gst::ClockTime::from_seconds(0),
-            )?;
+            ))?;
         } else {
-            self.source.seek(
+            self.send_seek(gst::event::Seek::new(
                 speed,
                 gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
                 gst::SeekType::Set,
                 gst::ClockTime::from_seconds(0),
                 gst::SeekType::Set,
                 position,
-            )?;
+            ))?;
         }
         self.speed = speed;
         Ok(())
     }
 
+    /// What a redraw of a playing stream does about its end: whether it ended (it then loops,
+    /// or pauses there), and the errors the bus reported since the last one.
+    pub(crate) fn poll_end(&mut self) -> (bool, Vec<gst::glib::Error>) {
+        let mut ended = false;
+        let mut errors = Vec::new();
+        while let Some(msg) = self
+            .bus
+            .pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos])
+        {
+            match msg.view() {
+                gst::MessageView::Error(err) => {
+                    error!("bus returned an error: {err}");
+                    errors.push(err.error());
+                }
+                gst::MessageView::Eos(_) => {
+                    let last = *self.last_seek.lock().expect("lock last_seek");
+                    ended |= last.is_none_or(|seek| seek == msg.seqnum());
+                }
+                _ => {}
+            }
+        }
+        // The video appsink's own EOS counts too: `playbin` posts its EOS only once every
+        // sink, the audio sink included, has drained.
+        ended |= self.reached_eos.load(Ordering::SeqCst);
+        if !ended {
+            return (false, errors);
+        }
+        if self.looping {
+            if let Err(err) = self.restart_stream() {
+                error!("cannot restart stream (can't seek): {err:#?}");
+            }
+        } else {
+            self.set_paused(true);
+            self.is_eos = true;
+        }
+        (true, errors)
+    }
+
     pub(crate) fn restart_stream(&mut self) -> Result<(), Error> {
         self.is_eos = false;
-        self.reached_eos.store(false, Ordering::SeqCst);
+        self.seek(Duration::ZERO, false)?;
         self.set_paused(false);
-        self.seek(0, false)?;
         Ok(())
     }
 
     pub(crate) fn set_paused(&mut self, paused: bool) {
+        // Played from its end, the stream starts over, and goes back to the start before it
+        // plays: a sink still holding the end posts it again on its way to playing, and the
+        // next update took that for the end of this play and paused it at once.
+        if self.is_eos && !paused {
+            self.is_eos = false;
+            if let Err(err) = self.seek(Duration::ZERO, false) {
+                error!("cannot restart stream (can't seek): {err:#?}");
+            }
+        }
         self.source
             .set_state(if paused {
                 gst::State::Paused
@@ -490,11 +546,6 @@ impl Internal {
                 gst::State::Playing
             })
             .unwrap(/* state was changed in ctor; state errors caught there */);
-
-        // Set restart_stream flag to make the stream restart on the next Message::NextFrame
-        if self.is_eos && !paused {
-            self.restart_stream = true;
-        }
     }
 
     pub(crate) fn paused(&self) -> bool {
@@ -972,7 +1023,7 @@ impl Video {
             reached_eos,
             looping: false,
             is_eos: false,
-            restart_stream: false,
+            last_seek: Mutex::new(None),
             sync_av_avg: 0,
             sync_av_counter: 0,
 
@@ -1067,7 +1118,6 @@ impl Video {
         // A flushing seek takes the stream off its end: played from there, it
         // goes on from where it was put rather than starting over.
         inner.is_eos = false;
-        inner.reached_eos.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1288,3 +1338,7 @@ fn yuv_to_rgba(
 
     rgba
 }
+
+#[cfg(test)]
+#[path = "eos_tests.rs"]
+mod eos_tests;

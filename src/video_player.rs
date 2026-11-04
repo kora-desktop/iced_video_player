@@ -1,5 +1,4 @@
 use crate::{pipeline::VideoPrimitive, video::Video};
-use gstreamer as gst;
 use iced::{
     Element,
     advanced::{self, Widget, layout, widget},
@@ -7,7 +6,6 @@ use iced::{
 use iced_wgpu::primitive::Renderer as PrimitiveRenderer;
 use std::{marker::PhantomData, sync::atomic::Ordering, time::Duration};
 use std::{sync::Arc, time::Instant};
-use tracing::error;
 
 /// Video player widget which displays the current frame of a [`Video`](crate::Video).
 #[allow(clippy::type_complexity)]
@@ -260,60 +258,15 @@ where
             if inner.dmabuf_rejected.load(Ordering::SeqCst) {
                 inner.fall_back();
             }
-            if inner.restart_stream || (!inner.is_eos && !inner.paused()) {
-                let mut restart_stream = false;
-                let emit_eos = !inner.restart_stream;
-                if inner.restart_stream {
-                    restart_stream = true;
-                    // Set flag to false to avoid potentially multiple seeks
-                    inner.restart_stream = false;
-                }
-                let mut eos_pause = false;
-                let mut eos = false;
-
-                while let Some(msg) = inner
-                    .bus
-                    .pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos])
-                {
-                    match msg.view() {
-                        gst::MessageView::Error(err) => {
-                            error!("bus returned an error: {err}");
-                            if let Some(ref on_error) = self.on_error {
-                                shell.publish(on_error(&err.error()))
-                            };
-                        }
-                        gst::MessageView::Eos(_eos) => eos = true,
-                        _ => {}
+            if !inner.is_eos && !inner.paused() {
+                let (ended, errors) = inner.poll_end();
+                for err in errors {
+                    if let Some(ref on_error) = self.on_error {
+                        shell.publish(on_error(&err));
                     }
                 }
-
-                // Also treat the video appsink's own EOS callback as end-of-stream:
-                // `playbin`'s bus EOS only fires once *all* sinks (incl. the auto
-                // audio sink) have drained, so the video-specific signal is a more
-                // direct "the video finished" for inline previews.
-                if !eos && inner.reached_eos.load(Ordering::SeqCst) {
-                    eos = true;
-                }
-
-                if eos {
-                    if emit_eos && let Some(on_end_of_stream) = self.on_end_of_stream.clone() {
-                        shell.publish(on_end_of_stream);
-                    }
-                    if inner.looping {
-                        restart_stream = true;
-                    } else {
-                        eos_pause = true;
-                    }
-                }
-
-                // Don't run eos_pause if restart_stream is true; fixes "pausing" after restarting a stream
-                if restart_stream {
-                    if let Err(err) = inner.restart_stream() {
-                        error!("cannot restart stream (can't seek): {err:#?}");
-                    }
-                } else if eos_pause {
-                    inner.is_eos = true;
-                    inner.set_paused(true);
+                if ended && let Some(on_end_of_stream) = self.on_end_of_stream.clone() {
+                    shell.publish(on_end_of_stream);
                 }
 
                 let has_new_frame = inner.upload_frame.load(Ordering::SeqCst);
