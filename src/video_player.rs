@@ -203,12 +203,6 @@ where
 
         let upload_frame = inner.upload_frame.swap(false, Ordering::SeqCst);
         if upload_frame {
-            // Reset notification flag so update() can publish on_new_frame
-            // again for the next frame.
-            inner.frame_notified.store(false, Ordering::SeqCst);
-        }
-
-        if upload_frame {
             let received_at = inner
                 .frame
                 .lock()
@@ -269,17 +263,10 @@ where
                     shell.publish(on_end_of_stream);
                 }
 
-                let has_new_frame = inner.upload_frame.load(Ordering::SeqCst);
-                // Only publish on_new_frame once per actual video frame.
-                // frame_notified is cleared by draw() when it consumes
-                // upload_frame, preventing duplicate messages.
-                let already_notified = inner.frame_notified.load(Ordering::SeqCst);
-
-                if has_new_frame && !already_notified {
-                    inner.frame_notified.store(true, Ordering::SeqCst);
-                    if let Some(on_new_frame) = self.on_new_frame.clone() {
-                        shell.publish(on_new_frame);
-                    }
+                // Once per frame, whether or not a draw showed it.
+                let new_frame = inner.take_new_frame();
+                if new_frame && let Some(on_new_frame) = self.on_new_frame.clone() {
+                    shell.publish(on_new_frame);
                 }
 
                 if let Some(on_subtitle_text) = &self.on_subtitle_text
@@ -289,7 +276,7 @@ where
                     shell.publish(on_subtitle_text(text.clone()));
                 }
 
-                if has_new_frame && !already_notified {
+                if new_frame {
                     // New frame ready — redraw immediately to display it.
                     shell.request_redraw();
                 } else {

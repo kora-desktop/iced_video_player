@@ -297,10 +297,11 @@ pub(crate) struct Internal {
 
     pub(crate) frame: Arc<Mutex<Frame>>,
     pub(crate) upload_frame: Arc<AtomicBool>,
-    /// Set to `true` by update() after publishing on_new_frame.
-    /// Cleared by draw() when it consumes upload_frame.
-    /// Prevents duplicate NewFrame messages per actual video frame.
-    pub(crate) frame_notified: Arc<AtomicBool>,
+    /// Counts the frames the sink has delivered. Unlike `upload_frame`, which only a draw
+    /// clears, it moves on while the player is scrolled out of view and draws nothing.
+    pub(crate) frame_seq: Arc<AtomicU64>,
+    /// The `frame_seq` the last `on_new_frame` was published for.
+    pub(crate) notified_seq: u64,
     /// Set by the video appsink's EOS callback when the stream ends (more
     /// reliable than the pipeline bus for this playbin+appsink setup).
     pub(crate) reached_eos: Arc<AtomicBool>,
@@ -482,6 +483,14 @@ impl Internal {
         }
         self.speed = speed;
         Ok(())
+    }
+
+    /// Whether a frame came since the last call, each frame counted once, drawn or not.
+    pub(crate) fn take_new_frame(&mut self) -> bool {
+        let seq = self.frame_seq.load(Ordering::SeqCst);
+        let fresh = seq != self.notified_seq;
+        self.notified_seq = seq;
+        fresh
     }
 
     /// What a redraw of a playing stream does about its end: whether it ended (it then loops,
@@ -829,6 +838,7 @@ impl Video {
 
         let frame = Arc::new(Mutex::new(Frame::empty()));
         let upload_frame = Arc::new(AtomicBool::new(false));
+        let frame_seq = Arc::new(AtomicU64::new(0));
         let alive = Arc::new(AtomicBool::new(true));
         // Set by the video appsink's EOS callback. `playbin` does not reliably
         // post EOS to the pipeline bus when a custom appsink video-sink (plus an
@@ -879,6 +889,7 @@ impl Video {
         {
             let frame_ref = Arc::clone(&frame);
             let upload_frame_ref = Arc::clone(&upload_frame);
+            let frame_seq_ref = Arc::clone(&frame_seq);
             let subtitle_text_ref = Arc::clone(&subtitle_text);
             let upload_text_ref = Arc::clone(&upload_text);
             let clear_at_ref = Arc::clone(&clear_subtitles_at);
@@ -913,6 +924,7 @@ impl Video {
                     };
                 }
                 upload_frame_ref.store(true, Ordering::SeqCst);
+                frame_seq_ref.fetch_add(1, Ordering::SeqCst);
 
                 Ok(gst::FlowSuccess::Ok)
             };
@@ -1019,7 +1031,8 @@ impl Video {
 
             frame,
             upload_frame,
-            frame_notified: Arc::new(AtomicBool::new(false)),
+            frame_seq,
+            notified_seq: 0,
             reached_eos,
             looping: false,
             is_eos: false,

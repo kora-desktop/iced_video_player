@@ -1,4 +1,5 @@
-//! A film played to its end and then played again, as a click on a slide's film does.
+//! Films played with no window: to their end and again, as a click on a slide's film does,
+//! and frame by frame with nothing drawn.
 
 use super::*;
 use std::time::{Duration, Instant};
@@ -66,5 +67,27 @@ fn a_film_played_again_from_its_end_plays_to_its_end() {
             "run {run} was stopped {ran:?} in, by the end before it"
         );
     }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A player scrolled out of view draws nothing, and its frames used to be told only after a
+/// draw: one `on_new_frame`, then none until it came back into view.
+#[test]
+fn every_frame_is_told_once_with_nothing_drawn() {
+    let path = film();
+    let url = url::Url::from_file_path(&path).expect("a file URL");
+    let mut video = Video::new(&url).expect("the film opens");
+    let mut told = 0;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(16));
+        let mut inner = video.get_mut();
+        told += usize::from(inner.take_new_frame());
+        assert!(!inner.take_new_frame(), "a frame is told once");
+        if inner.poll_end().0 {
+            break;
+        }
+    }
+    assert!(told >= 10, "{told} of 15 frames told");
     let _ = std::fs::remove_file(&path);
 }
